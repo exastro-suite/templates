@@ -1,0 +1,25 @@
+##################################################
+# 変数定義
+##################################################
+# 現在時刻取得とバックアップファイル名取得
+- name: Set Rest Info and Now Datetime
+  set_fact:
+    _now_datetime: '{{ lookup(''pipe'', ''date "+%Y%m%d%H%M%S"'') }}'
+  delegate_to: localhost
+
+# バックアップファイル作成
+- name: Make hosts copyfile  
+  shell:
+    cmd: "cp -p /etc/hosts /etc/hosts_{{ _now_datetime }}"
+  become: yes
+
+# hostsファイルコピー
+- name: deploy hosts
+  copy:
+    src: "{{ VAR_file_embedded_variables }}"
+    dest: /etc/hosts
+    owner: root
+    group: root
+    mode: 0644
+  become: yes
+  

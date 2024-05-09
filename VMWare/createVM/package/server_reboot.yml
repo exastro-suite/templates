@@ -1,0 +1,27 @@
+# VMwareに接続する
+# ログイン情報はグローバル変数で管理する
+- name: vmware attach
+  vmware_about_info:
+    hostname: "{{ VAR_vcenter_hostname }}"
+    username: "{{ VAR_vcenter_username }}"
+    password: "{{ VAR_vcenter_password }}"
+    validate_certs: false 
+  delegate_to: localhost 
+  register: login
+
+- name: Set vm_state
+  set_fact:
+    vm_state: "{{ VAR_vm_state }}"
+
+- name: Connect a virtual machine from a template
+  community.vmware.vmware_guest_powerstate:
+    hostname: "{{ VAR_vcenter_hostname }}"
+    username: "{{ VAR_vcenter_username }}"
+    password: "{{ VAR_vcenter_password }}"
+    folder: "{{ VAR_folder }}"
+    name: "{{ __inventory_hostname__ }}"
+    validate_certs: no
+    state: reboot-guest
+  delegate_to: localhost
+  register: deploy
+  when: vm_state == "再起動"

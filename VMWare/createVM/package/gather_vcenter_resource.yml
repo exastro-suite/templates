@@ -1,0 +1,294 @@
+---
+##################################################
+# 変数定義
+##################################################
+# REST用情報の準備
+- name: Set Rest Info and Now Datetime
+  set_fact:
+    _menu_name: "resource_management"
+  delegate_to: localhost
+  
+ # Operation name select を成形
+- name: Create operation name select
+  set_fact:
+    _operation_name: "{{ __operation__ | regex_replace('(?<=_)(.*)(.*)(?<=:)') }}"
+  delegate_to: localhost
+
+# 管理者パスワードをbase64エンコードをして取得
+- name: Get administrator password with base64 encoding
+  shell:
+    cmd: echo -n "{{ GBL_ITA_REST_user_id }}:{{ GBL_ITA_REST_user_password }}" | base64
+  register: _admin_pass
+
+##################################################
+# クラスターに登録されている情報を取得し、
+# 取得したESXiの情報からESXi名ごとにCPU数、空きメモリ数、総メモリ数を抽出する。
+##################################################
+# クラスターに登録されている情報を取得
+- name: Get Cluster Info
+  vmware_cluster_info:
+    hostname: "{{ VAR_vcenter_hostname }}"
+    username: "{{ VAR_vcenter_username }}"
+    password: "{{ VAR_vcenter_password }}"
+    cluster_name: "{{ VAR_vcenter_cluster }}"
+    validate_certs: no
+  delegate_to: localhost
+  register: _result_cluster_INFO
+
+# ESXi名を抽出
+- name: Set _TMP_hosts_INFO
+  set_fact:
+    _TMP_hosts_INFO: "{{ item.value.hosts }}"
+  with_dict: "{{ _result_cluster_INFO.clusters }}"
+  delegate_to: localhost
+
+# 各ESXiの情報を取得
+- name: Get ESXi Info
+  vmware_host_facts:
+    hostname: "{{ VAR_vcenter_hostname }}"
+    username: "{{ VAR_vcenter_username }}"
+    password: "{{ VAR_vcenter_password }}"
+    esxi_hostname: "{{ item.name }}"
+    validate_certs: no
+  delegate_to: localhost
+  register: _result_esxi_INFO
+  with_list: "{{ _TMP_hosts_INFO }}"
+
+# 結果の表示
+- name: Viewing results
+  debug:
+    msg: "{{ _result_esxi_INFO }}"
+
+# 取得したESXiの情報からESXi名ごとにCPU数、空きメモリ数、総メモリ数、ディスク容量を抽出
+- name: Set _esxi_INFO_list
+  set_fact:
+    _esxi_INFO_list: >-
+      {%- set _TMP_DICT_outer = {} -%}
+      {%- set _TMP_DICT_inner = {} -%}
+      {%- for _value in _result_esxi_INFO.results -%}
+      {%-   set _ =  _TMP_DICT_inner.update({"CPU":_value.ansible_facts.ansible_processor_cores}) -%}
+      {%-   set _ =  _TMP_DICT_inner.update({"memory_total":_value.ansible_facts.ansible_memtotal_mb}) -%}
+      {%-   set _ =  _TMP_DICT_inner.update({"memory_free":_value.ansible_facts.ansible_memfree_mb}) -%}
+      {%-   set _ =  _TMP_DICT_inner.update({"disc_total":_value.ansible_facts.ansible_datastore[1].total[:-3] |int }) -%}
+      {%-   set _ =  _TMP_DICT_inner.update({"disc_free":_value.ansible_facts.ansible_datastore[1].free[:-3] |int }) -%}
+      {%-   set _ =  _TMP_DICT_outer.update({_value.ansible_facts.ansible_hostname:_TMP_DICT_inner}) -%}
+      {%- endfor -%}
+      {{ _TMP_DICT_outer }}
+  delegate_to: localhost
+
+##################################################
+# vCenterに登録されている全てのVM情報を取得し、
+# 取得した情報からESXi名ごとに利用中のCPU数を抽出する。
+##################################################
+# 存在している全てのVMの情報を取得
+- name: Get ALL VM Info
+  vmware_vm_info:
+    hostname: "{{ VAR_vcenter_hostname }}"
+    username: "{{ VAR_vcenter_username }}"
+    password: "{{ VAR_vcenter_password }}"
+    vm_type: vm
+    show_allocated: yes
+    validate_certs: no
+  delegate_to: localhost
+  register: _result_VM_INFO
+
+# ESXi名ごとにCPU使用数を計算する
+- name: Calculation total CPU From ESXi Name
+  set_fact:
+    _VM_total_cpu_count_list: >-
+      {%- set _TMP_DICT_outer = {} -%}
+      {%- for _esxi_value in _TMP_hosts_INFO -%}
+      {%-   set _NUM = namespace(total = 0) -%}
+      {%-   for VM_value in _result_VM_INFO.virtual_machines -%}
+      {%-     if VM_value.esxi_hostname == _esxi_value.name -%}
+      {%-       if VM_value.power_state in "poweredOn" -%}
+      {%-         set _NUM.total = _NUM.total + VM_value.allocated.cpu -%}
+      {%-       endif -%}
+      {%-     endif -%}
+      {%-   endfor -%}
+      {%-   set _ =  _TMP_DICT_outer.update({_esxi_value.name: _NUM.total}) -%}
+      {%- endfor -%}
+      {{ _TMP_DICT_outer }}
+  delegate_to: localhost
+
+##################################################
+# 利用情報の集計をする
+##################################################
+# 利用情報集計(四捨五入)
+- name: Set Usage Information
+  set_fact:
+    _esxi_resource: >-
+      {%- set _TMP_DICT_outer = {} -%}
+      {%- for _esxi_key, _esxi_value in _esxi_INFO_list.items() -%}
+      {%-   set _TMP_DICT_inner = {} -%}
+      {#- 総CPU数 -#}
+      {%-   set _ =  _TMP_DICT_inner.update({ "cpu_total": _esxi_value.CPU }) -%}
+      {#- 総メモリ量 MB -> GB  -#}
+      {%-   set memory_use_total = _esxi_value.memory_total / 1024 -%}
+      {%-   set _ =  _TMP_DICT_inner.update({ "memory_total": memory_use_total |round |int  }) -%}
+      {#- 空きメモリ量 MB -> GB  -#}
+      {%-   set memory_free_NUM = _esxi_value.memory_free / 1024 -%}
+      {%-   set _ =  _TMP_DICT_inner.update({ "memory_free": memory_free_NUM |round |int }) -%}
+      {#- 総ディスク量 TB -> GB  -#}
+      {%-   set disc_use_total = _esxi_value.disc_total * 1024 -%}
+      {%-   set _ =  _TMP_DICT_inner.update({ "disc_total": disc_use_total }) -%}
+      {#- 空きディスク量 TB -> GB  -#}
+      {%-   set disc_free_NUM = _esxi_value.disc_free * 1024 -%}
+      {%-   set _ =  _TMP_DICT_inner.update({ "disc_free": disc_free_NUM }) -%}
+      {#- ディスク使用量計算 -#}
+      {%-   set disc_use_NUM = ( disc_use_total - disc_free_NUM ) -%}
+      {%-   set _ =  _TMP_DICT_inner.update({ "disc_use": disc_use_NUM }) -%}
+      {#- CPU使用率計算 -#}
+      {%-   for VM_key, VM_value in _VM_total_cpu_count_list.items() -%}
+      {%-     if VM_key == _esxi_key -%}
+      {%-       set cpu_percent_NUM = VM_value / _esxi_value.CPU * 100 -%}
+      {#- CPU使用率 -#}
+      {%-       set _ =  _TMP_DICT_inner.update({ "cpu_usage_rate": cpu_percent_NUM |round |int }) -%}
+      {#- CPU使用数 -#}
+      {%-       set _ =  _TMP_DICT_inner.update({ "cpu_use": VM_value }) -%}
+      {#- CPU未使用数 -#}
+      {%-       set cpu_free_NUM = _esxi_value.CPU - VM_value -%}
+      {%-       set _ =  _TMP_DICT_inner.update({ "cpu_free": cpu_free_NUM }) -%}
+      {%-     endif -%}
+      {%-   endfor -%}
+      {#- メモリ使用量計算 MB -> GB -#}
+      {%-   set memory_use_NUM = ( _esxi_value.memory_total - _esxi_value.memory_free ) / 1024 -%}
+      {%-   set _ =  _TMP_DICT_inner.update({ "memory_use": memory_use_NUM |round |int }) -%}
+      {#- メモリ使用率計算  -#}
+      {%-   set memory_percent_NUM =  ( _esxi_value.memory_total - _esxi_value.memory_free ) / _esxi_value.memory_total * 100 -%}
+      {%-   set _ =  _TMP_DICT_inner.update({ "memory_usage_rate": memory_percent_NUM |round |int }) -%}
+      {%-   set _ =  _TMP_DICT_outer.update({ _esxi_key: _TMP_DICT_inner }) -%}
+      {%- endfor -%}
+      {{ _TMP_DICT_outer }}
+  delegate_to: localhost
+
+# レコード情報の取得
+- name: Get record information
+  uri:
+    url: "http://{{ GBL_ITA_hostname }}/api/{{ GBL_orgid }}/workspaces/{{ GBL_wsid }}/ita/menu/{{ _menu_name }}/filter/"
+    method: POST
+    body_format: json
+    status_code: 200
+    headers:
+      Authorization: "Basic {{ _admin_pass.stdout }}"
+      accept: application/json
+      Content-Type: application/json
+    body:
+      discard:
+        LIST: 
+          - "0"
+      host_name:
+        LIST:
+          - "{{ __inventory_hostname__ }}"
+      operation_name_select: 
+        LIST: 
+          - "{{ _operation_name }}"
+  register: _record_info
+
+##################################################
+# ITAへRESTする
+##################################################
+# ITAへの新規登録のブロック
+- block:
+  - name: Create Rest Body
+    set_fact:
+      _rest_body: >-
+        {%- set _TMP_LIST_outer = [] -%}
+        {%- for _esxi_key, _esxi_value in _esxi_resource.items() -%}
+        {%-   set _TMP_DICT_outer = {} -%}
+        {%-   set _TMP_DICT_inner = {} -%}
+        {%-   set _ =  _TMP_DICT_inner.update({ "discard": "0" }) -%}
+        {%-   set _ =  _TMP_DICT_inner.update({ "host_name": __inventory_hostname__ }) -%}
+        {%-   set _ =  _TMP_DICT_inner.update({ "operation_name_select": _operation_name }) -%}
+        {%-   set _ =  _TMP_DICT_inner.update({ "ESXi_name": _esxi_key }) -%}
+        {%-   set _ =  _TMP_DICT_inner.update({ "input_order": loop.index }) -%}
+        {%-   set _ =  _TMP_DICT_inner.update({ "memory_now_gb": _esxi_value.memory_use }) -%}
+        {%-   set _ =  _TMP_DICT_inner.update({ "memory_max_gb": _esxi_value.memory_total }) -%}
+        {%-   set _ =  _TMP_DICT_inner.update({ "memory_free_gb": _esxi_value.memory_free }) -%}
+        {%-   set _ =  _TMP_DICT_inner.update({ "cpu_now_core": _esxi_value.cpu_use }) -%}
+        {%-   set _ =  _TMP_DICT_inner.update({ "cpu_max_core": _esxi_value.cpu_total }) -%}
+        {%-   set _ =  _TMP_DICT_inner.update({ "cpu_usage_rate": _esxi_value.cpu_usage_rate }) -%}
+        {%-   set _ =  _TMP_DICT_inner.update({ "disc_now_gb": _esxi_value.disc_use }) -%}
+        {%-   set _ =  _TMP_DICT_inner.update({ "disc_max_gb": _esxi_value.disc_total }) -%}
+        {%-   set _ =  _TMP_DICT_inner.update({ "disc_free_gb": _esxi_value.disc_free }) -%}
+        {%-   set _ =  _TMP_DICT_outer.update({ "parameter": _TMP_DICT_inner }) -%}
+        {%-   set _ =  _TMP_DICT_outer.update({ "type": "Register" }) -%}
+        {%-   set _ =  _TMP_LIST_outer.append( _TMP_DICT_outer ) -%}
+        {%- endfor -%}
+        {{ _TMP_LIST_outer}}
+    delegate_to: localhost
+
+  # ITAに利用情報を登録
+  - name: Record ESXi Resource to ITA
+    uri:
+      url: "http://{{ GBL_ITA_hostname }}/api/{{ GBL_orgid }}/workspaces/{{ GBL_wsid }}/ita/menu/{{ _menu_name }}/maintenance/all/"
+      method: POST
+      headers:
+        Authorization: "Basic {{ _admin_pass.stdout }}"
+        accept: application/json
+        Content-Type: "application/json"
+      status_code: 200
+      return_content: true
+      body_format: json
+      body: "{{ _rest_body }}"
+    register: _result_ITA_record
+  #  ITAへの新規登録の条件     
+  when: _record_info.json.data | list | length == 0
+
+##################################################
+# ITAのレコードを更新
+##################################################
+#　レコード更新のブロック
+- block:
+    # 更新のREST BODYを作成
+    - name: Create REST BODY for update
+      set_fact:
+        _rest_body: >-
+          {%- set _TMP_LIST_outer = [] -%}
+          {%- for _esxi_key, _esxi_value in _esxi_resource.items() -%}
+          {%-   for num in range(_record_info.json.data | list | length) -%}
+          {%-     if _record_info.json.data[num].parameter.ESXi_name == _esxi_key -%}
+          {%-       set _TMP_DICT_outer = {} -%}
+          {%-       set _TMP_DICT_inner = {} -%}
+          {%-       set _ =  _TMP_DICT_inner.update({ "uuid": _record_info.json.data[num].parameter.uuid }) -%}
+          {%-       set _ =  _TMP_DICT_inner.update({ "discard": _record_info.json.data[num].parameter.discard }) -%}
+          {%-       set _ =  _TMP_DICT_inner.update({ "host_name": _record_info.json.data[num].parameter.host_name }) -%}
+          {%-       set _ =  _TMP_DICT_inner.update({ "operation_name_select": _record_info.json.data[num].parameter.operation_name_select }) -%}
+          {%-       set _ =  _TMP_DICT_inner.update({ "ESXi_name": _record_info.json.data[num].parameter.ESXi_name }) -%}
+          {%-       set _ =  _TMP_DICT_inner.update({ "input_order": _record_info.json.data[num].parameter.input_order }) -%}
+          {%-       set _ =  _TMP_DICT_inner.update({ "memory_now_gb": _esxi_value.memory_use }) -%}
+          {%-       set _ =  _TMP_DICT_inner.update({ "memory_max_gb": _esxi_value.memory_total }) -%}
+          {%-       set _ =  _TMP_DICT_inner.update({ "memory_free_gb": _esxi_value.memory_free }) -%}
+          {%-       set _ =  _TMP_DICT_inner.update({ "cpu_now_core": _esxi_value.cpu_use }) -%}
+          {%-       set _ =  _TMP_DICT_inner.update({ "cpu_max_core": _esxi_value.cpu_total }) -%}
+          {%-       set _ =  _TMP_DICT_inner.update({ "cpu_free_core": _esxi_value.cpu_free }) -%}
+          {%-       set _ =  _TMP_DICT_inner.update({ "disc_now_gb": _esxi_value.disc_use }) -%}
+          {%-       set _ =  _TMP_DICT_inner.update({ "disc_max_gb": _esxi_value.disc_total }) -%}
+          {%-       set _ =  _TMP_DICT_inner.update({ "disc_free_gb": _esxi_value.disc_free }) -%}
+          {%-       set _ =  _TMP_DICT_inner.update({ "last_update_date_time": _record_info.json.data[num].parameter.last_update_date_time }) -%}
+          {%-       set _ =  _TMP_DICT_outer.update({ "parameter": _TMP_DICT_inner }) -%}
+          {%-       set _ =  _TMP_DICT_outer.update({ "type": "Update" }) -%}
+          {%-       set _ =  _TMP_LIST_outer.append( _TMP_DICT_outer ) -%}
+          {%-     endif -%}
+          {%-   endfor -%}
+          {%- endfor -%}
+          {{ _TMP_LIST_outer}}
+      delegate_to: localhost
+    
+    # ITAのレコードを更新する
+    - name: Update records.
+      uri:
+        url: "http://{{ GBL_ITA_hostname }}/api/{{ GBL_orgid }}/workspaces/{{ GBL_wsid }}/ita/menu/{{ _menu_name }}/maintenance/all/"
+        method: POST
+        body_format: json
+        status_code: 200
+        return_content: true
+        headers:
+          Authorization: "Basic {{ _admin_pass.stdout }}"
+          accept: application/json
+          Content-Type: application/json
+        body: "{{ _rest_body }}"
+      register: _update_records
+
+  # レコードの更新の条件
+  when: _record_info.json.data | list | length >= 1 

@@ -1,0 +1,99 @@
+# VMの払い出しを行う
+
+##################################################
+# 変数定義
+##################################################
+# REST用情報の準備と現在時刻取得
+- name: Set Rest Info and Now Datetime
+  set_fact:
+    _menu_name: "device_list"
+    _vm_user: "{{ VAR_VM_username }}"
+    _vm_password: "{{ VAR_VM_password }}"
+  delegate_to: localhost
+  
+# 管理者パスワードをbase64エンコードをして取得
+- name: Get administrator password with base64 encoding
+  shell:
+    cmd: echo -n "{{ GBL_ITA_REST_user_id }}:{{ GBL_ITA_REST_user_password }}" | base64
+  register: _admin_pass
+
+# VMwareに接続する
+# ログイン情報はグローバル変数で管理する
+- name: vmware attach
+  vmware_about_info:
+    hostname: '{{ VAR_vcenter_hostname }}'
+    username: '{{ VAR_vcenter_username }}'
+    password: '{{ VAR_vcenter_password }}'
+    validate_certs: false 
+  delegate_to: localhost 
+  register: login
+
+# テンプレートを使ってVMを作成する
+- name: Create a virtual machine from a template
+  community.vmware.vmware_guest:
+    hostname: '{{ VAR_vcenter_hostname }}'
+    username: '{{ VAR_vcenter_username }}'
+    password: '{{ VAR_vcenter_password }}'
+    datacenter: '{{ GBL_datacenter }}'
+    folder: '{{ VAR_folder }}'
+    name: '{{ VAR_name }}'
+    state: poweredon
+    template: '{{ VAR_template }}'
+    disk:
+    - size_gb: '{{ VAR_size_gb }}'
+      datastore: '{{ VAR_datastore }}'
+    hardware:
+      memory_mb: '{{ VAR_memory_mb }}'
+      num_cpus: '{{ VAR_num_cpu }}'
+    validate_certs: false
+    networks: 
+    - name: '{{ VAR_nwname }}' 
+      ip: '{{ VAR_ip }}'
+      netmask: '{{ VAR_subnetmask }}'
+      gateway: '{{ VAR_gw }}'
+    customization:
+      dns_servers:
+        - '{{ VAR_dns1 }}'
+        - '{{ VAR_dns2 }}'
+    wait_for_ip_address: true  
+  delegate_to: localhost
+  register: deploy
+
+- name: Get IPAddress
+  debug: 
+    msg: "{{ deploy }}"
+
+
+# ITAへRESTをする
+- name: Create Rest Body
+  set_fact:
+    _rest_body: >-
+      {%-   set _TMP_DICT_inner = {} -%}
+      {%-   set _ =  _TMP_DICT_inner.update({ "discard": "0" }) -%}
+      {%-   set _ =  _TMP_DICT_inner.update({ "hw_device_type": "SV" }) -%}
+      {%-   set _ =  _TMP_DICT_inner.update({ "host_name": VAR_name }) -%}
+      {%-   set _ =  _TMP_DICT_inner.update({ "ip_address": deploy.instance.ipv4 }) -%}
+      {%-   set _ =  _TMP_DICT_inner.update({ "login_user": _vm_user }) -%}
+      {%-   set _ =  _TMP_DICT_inner.update({ "login_password": _vm_password }) -%}
+      {%-   set _ =  _TMP_DICT_inner.update({ "authentication_method": "パスワード認証" }) -%}
+      {%-   set _ =  _TMP_DICT_inner.update({ "connection_type": "machine" }) -%}
+      {{ _TMP_DICT_inner }}
+  delegate_to: localhost
+
+
+# 機器一覧に登録する
+- name: Record VM to ITA
+  uri:
+    url: "http://{{ GBL_ITA_hostname }}/api/{{ GBL_orgid }}/workspaces/{{ GBL_wsid }}/ita/menu/{{ _menu_name }}/maintenance/"
+    method: POST
+    headers:
+      Authorization: "Basic {{ _admin_pass.stdout }}"
+      accept: application/json
+      Content-Type: "application/json"
+    status_code: 200
+    return_content: true
+    body_format: json
+    body:
+      parameter: "{{ _rest_body }}"
+      type: "Register"
+  register: _result_ITA_record
